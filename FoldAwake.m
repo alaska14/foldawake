@@ -49,6 +49,11 @@ extern double IOHIDEventGetFloatValue(IOHIDEventRef event, int32_t field);
 - (void)runThermalCheck;
 - (BOOL)checkThermalAbnormalities:(NSString **)outReason peakTemp:(double *)outPeak;
 - (double)currentPeakTemperature;
+- (BOOL)isKeyboardIdleDimmedOrSuppressed;
+- (float)currentKeyboardBrightness;
+- (void)setKeyboardBrightness:(float)val commit:(BOOL)commit;
+- (void)setKeyboardBrightness:(float)val;
+- (void)registerKeyboardNotifications;
 @end
 
 static void powerNotificationCallback(void *refCon, io_service_t service, natural_t messageType, void *messageArgument) {
@@ -73,8 +78,15 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     self.savedDisplayBrightness = [self currentDisplayBrightness];
     if (self.savedDisplayBrightness <= 0.05f) self.savedDisplayBrightness = 0.8f;
 
-    // Record user's exact keyboard brightness (including 0.0f if turned off)
-    self.savedKeyboardBrightness = [self currentKeyboardBrightness];
+    // Load preserved keyboard brightness from NSUserDefaults or active hardware
+    float persistedK = [[NSUserDefaults standardUserDefaults] floatForKey:@"FoldAwakeSavedKeyboardBrightness"];
+    if (persistedK > 0.01f) {
+        self.savedKeyboardBrightness = persistedK;
+    } else {
+        float curK = [self currentKeyboardBrightness];
+        self.savedKeyboardBrightness = (curK > 0.01f) ? curK : 0.40f;
+        [[NSUserDefaults standardUserDefaults] setFloat:self.savedKeyboardBrightness forKey:@"FoldAwakeSavedKeyboardBrightness"];
+    }
 
     // Set up Status Item
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
@@ -99,6 +111,9 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     // Register 100% event-driven IOKit clamshell notification (0.0% CPU, NO POLLING!)
     [self registerClamshellNotification];
 
+    // Register event-driven keyboard brightness notification
+    [self registerKeyboardNotifications];
+
     // Passive low-overhead brightness check (every 15s, purely in-memory, zero subshells)
     self.brightnessCacheTimer = [NSTimer scheduledTimerWithTimeInterval:15.0 target:self selector:@selector(cacheActiveBrightness) userInfo:nil repeats:YES];
 }
@@ -121,10 +136,19 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 - (void)cacheActiveBrightness {
     if (!self.wasDimmedForClamshell && ![self isLidClosed]) {
         float curD = [self currentDisplayBrightness];
-        float curK = [self currentKeyboardBrightness];
-        if (curD > 0.05f) self.savedDisplayBrightness = curD;
-        // Reliably record keyboard brightness, including 0.0f
-        self.savedKeyboardBrightness = curK;
+        if (curD > 0.05f) {
+            self.savedDisplayBrightness = curD;
+        }
+
+        // Only record active keyboard brightness if it's NOT currently idle-dimmed or suppressed by ambient light!
+        if (![self isKeyboardIdleDimmedOrSuppressed]) {
+            float curK = [self currentKeyboardBrightness];
+            if (curK > 0.01f) {
+                self.savedKeyboardBrightness = curK;
+                [[NSUserDefaults standardUserDefaults] setFloat:curK forKey:@"FoldAwakeSavedKeyboardBrightness"];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+            }
+        }
     }
 }
 
@@ -233,6 +257,54 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     return self.keyboardClient;
 }
 
+- (void)registerKeyboardNotifications {
+    id client = [self getKeyboardClient];
+    if (client) {
+        SEL selCopy = @selector(copyKeyboardBacklightIDs);
+        SEL selReg = @selector(registerNotificationForKeys:keyboardID:block:);
+        if ([client respondsToSelector:selCopy] && [client respondsToSelector:selReg]) {
+            NSArray *ids = ((id (*)(id, SEL))[client methodForSelector:selCopy])(client, selCopy);
+            if (ids && ids.count > 0) {
+                unsigned long long kid = [ids[0] unsignedLongLongValue];
+                __weak AppDelegate *weakSelf = self;
+                void (^block)(id) = ^(id key) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [weakSelf cacheActiveBrightness];
+                    });
+                };
+                ((void (*)(id, SEL, id, unsigned long long, id))[client methodForSelector:selReg])(client, selReg, @[@"KeyboardBacklightBrightness"], kid, block);
+            }
+        }
+    }
+}
+
+- (BOOL)isKeyboardIdleDimmedOrSuppressed {
+    id client = [self getKeyboardClient];
+    if (client) {
+        SEL selCopy = @selector(copyKeyboardBacklightIDs);
+        SEL selIsDim = @selector(isBacklightDimmedOnKeyboard:);
+        SEL selIsSupp = @selector(isBacklightSuppressedOnKeyboard:);
+
+        NSArray *ids = nil;
+        if ([client respondsToSelector:selCopy]) {
+            ids = ((id (*)(id, SEL))[client methodForSelector:selCopy])(client, selCopy);
+        }
+        if (ids && ids.count > 0) {
+            unsigned long long kid = [ids[0] unsignedLongLongValue];
+            BOOL isDim = NO;
+            BOOL isSupp = NO;
+            if ([client respondsToSelector:selIsDim]) {
+                isDim = ((BOOL (*)(id, SEL, unsigned long long))[client methodForSelector:selIsDim])(client, selIsDim, kid);
+            }
+            if ([client respondsToSelector:selIsSupp]) {
+                isSupp = ((BOOL (*)(id, SEL, unsigned long long))[client methodForSelector:selIsSupp])(client, selIsSupp, kid);
+            }
+            return (isDim || isSupp);
+        }
+    }
+    return NO;
+}
+
 - (float)currentKeyboardBrightness {
     id client = [self getKeyboardClient];
     if (client) {
@@ -241,23 +313,23 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
         if ([client respondsToSelector:selCopy] && [client respondsToSelector:selGet]) {
             NSArray *ids = ((id (*)(id, SEL))[client methodForSelector:selCopy])(client, selCopy);
             if (ids && ids.count > 0) {
-                unsigned long kid = [ids[0] unsignedLongValue];
-                return ((float (*)(id, SEL, unsigned long))[client methodForSelector:selGet])(client, selGet, kid);
+                unsigned long long kid = [ids[0] unsignedLongLongValue];
+                return ((float (*)(id, SEL, unsigned long long))[client methodForSelector:selGet])(client, selGet, kid);
             }
         }
         if ([client respondsToSelector:selGet]) {
-            return ((float (*)(id, SEL, unsigned long))[client methodForSelector:selGet])(client, selGet, 1);
+            return ((float (*)(id, SEL, unsigned long long))[client methodForSelector:selGet])(client, selGet, 1ULL);
         }
     }
     return 0.0f;
 }
 
-- (void)setKeyboardBrightness:(float)val {
+- (void)setKeyboardBrightness:(float)val commit:(BOOL)commit {
     id client = [self getKeyboardClient];
     if (client) {
         SEL selCopy = @selector(copyKeyboardBacklightIDs);
-        SEL selSet = @selector(setBrightness:forKeyboard:);
-        SEL selSetAuto = @selector(enableAutoBrightness:forKeyboard:);
+        SEL selSetCommit = @selector(setBrightness:fadeSpeed:commit:forKeyboard:);
+        SEL selSetSimple = @selector(setBrightness:forKeyboard:);
 
         NSArray *ids = nil;
         if ([client respondsToSelector:selCopy]) {
@@ -266,24 +338,25 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
         if (ids && ids.count > 0) {
             for (NSNumber *nid in ids) {
-                unsigned long kid = [nid unsignedLongValue];
-                // Disable auto-brightness so macOS ambient light sensor doesn't bump a 0% keyboard back to 20%
-                if ([client respondsToSelector:selSetAuto]) {
-                    ((BOOL (*)(id, SEL, BOOL, unsigned long))[client methodForSelector:selSetAuto])(client, selSetAuto, NO, kid);
-                }
-                if ([client respondsToSelector:selSet]) {
-                    ((void (*)(id, SEL, float, unsigned long))[client methodForSelector:selSet])(client, selSet, val, kid);
+                unsigned long long kid = [nid unsignedLongValue];
+                if ([client respondsToSelector:selSetCommit]) {
+                    ((BOOL (*)(id, SEL, float, int, BOOL, unsigned long long))[client methodForSelector:selSetCommit])(client, selSetCommit, val, 1, commit, kid);
+                } else if ([client respondsToSelector:selSetSimple]) {
+                    ((void (*)(id, SEL, float, unsigned long long))[client methodForSelector:selSetSimple])(client, selSetSimple, val, kid);
                 }
             }
         } else {
-            if ([client respondsToSelector:selSetAuto]) {
-                ((BOOL (*)(id, SEL, BOOL, unsigned long))[client methodForSelector:selSetAuto])(client, selSetAuto, NO, 1);
-            }
-            if ([client respondsToSelector:selSet]) {
-                ((void (*)(id, SEL, float, unsigned long))[client methodForSelector:selSet])(client, selSet, val, 1);
+            if ([client respondsToSelector:selSetCommit]) {
+                ((BOOL (*)(id, SEL, float, int, BOOL, unsigned long long))[client methodForSelector:selSetCommit])(client, selSetCommit, val, 1, commit, 1ULL);
+            } else if ([client respondsToSelector:selSetSimple]) {
+                ((void (*)(id, SEL, float, unsigned long long))[client methodForSelector:selSetSimple])(client, selSetSimple, val, 1ULL);
             }
         }
     }
+}
+
+- (void)setKeyboardBrightness:(float)val {
+    [self setKeyboardBrightness:val commit:YES];
 }
 
 - (float)currentDisplayBrightness {
@@ -342,9 +415,12 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     } else {
         // Clamshell folded shut!
         if (self.isAwake && !self.wasDimmedForClamshell) {
+            // First cache active user brightness immediately before dimming
+            [self cacheActiveBrightness];
+
             // Lid just shut while active! Dim display & keyboard to 0%
             [self setDisplayBrightness:0.0f];
-            [self setKeyboardBrightness:0.0f];
+            [self setKeyboardBrightness:0.0f commit:NO];
             self.wasDimmedForClamshell = YES;
 
             // Run zombie cleanup once when packed away
@@ -539,17 +615,32 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 - (void)restoreBrightness {
     if (self.wasDimmedForClamshell) {
         float targetD = (self.savedDisplayBrightness > 0.05f) ? self.savedDisplayBrightness : 0.8f;
-        // Restore user's exact keyboard level, staying at 0.0f if they chose to keep it off!
+
+        // Strictly preserve user's preferred keyboard level
         float targetK = self.savedKeyboardBrightness;
+        if (targetK <= 0.01f) {
+            float persistedK = [[NSUserDefaults standardUserDefaults] floatForKey:@"FoldAwakeSavedKeyboardBrightness"];
+            if (persistedK > 0.01f) {
+                targetK = persistedK;
+                self.savedKeyboardBrightness = persistedK;
+            } else {
+                targetK = 0.40f;
+            }
+        }
 
         [self setDisplayBrightness:targetD];
-        [self setKeyboardBrightness:targetK];
+        [self setKeyboardBrightness:targetK commit:YES];
         self.wasDimmedForClamshell = NO;
 
-        // Re-assert after 0.35s to prevent macOS ambient sensor from overriding
+        // Anti-glitch multi-assertion: macOS CoreBrightness wake daemon re-evaluates
+        // backlight ~200-500ms after lid open. Re-assert with commit:YES at 0.35s and 0.80s
+        // so the user's exact setting strictly wins every single time!
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [self setDisplayBrightness:targetD];
-            [self setKeyboardBrightness:targetK];
+            [self setKeyboardBrightness:targetK commit:YES];
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.80 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self setKeyboardBrightness:targetK commit:YES];
         });
     }
 }
