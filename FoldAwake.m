@@ -26,8 +26,12 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
     // Load CoreBrightness framework for keyboard illumination control
     [[NSBundle bundleWithPath:@"/System/Library/PrivateFrameworks/CoreBrightness.framework"] load];
 
-    self.savedDisplayBrightness = 0.8f;
-    self.savedKeyboardBrightness = 0.4f;
+    self.savedDisplayBrightness = [self currentDisplayBrightness];
+    if (self.savedDisplayBrightness <= 0.05f) self.savedDisplayBrightness = 0.8f;
+
+    self.savedKeyboardBrightness = [self currentKeyboardBrightness];
+    if (self.savedKeyboardBrightness <= 0.01f) self.savedKeyboardBrightness = 0.5f;
+
     self.wasDimmedForClamshell = NO;
 
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
@@ -39,7 +43,7 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 
     self.timer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(updateStateFromSystem) userInfo:nil repeats:YES];
     self.watchdogTimer = [NSTimer scheduledTimerWithTimeInterval:120.0 target:self selector:@selector(reapRunawayZombies) userInfo:nil repeats:YES];
-    self.clamshellTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(checkClamshellAndBacklights) userInfo:nil repeats:YES];
+    self.clamshellTimer = [NSTimer scheduledTimerWithTimeInterval:0.4 target:self selector:@selector(checkClamshellAndBacklights) userInfo:nil repeats:YES];
     
     [self reapRunawayZombies];
 }
@@ -126,7 +130,15 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 - (float)currentKeyboardBrightness {
     id client = [self getKeyboardClient];
     if (client) {
+        SEL selCopy = @selector(copyKeyboardBacklightIDs);
         SEL selGet = @selector(brightnessForKeyboard:);
+        if ([client respondsToSelector:selCopy] && [client respondsToSelector:selGet]) {
+            NSArray *ids = ((id (*)(id, SEL))[client methodForSelector:selCopy])(client, selCopy);
+            if (ids && ids.count > 0) {
+                unsigned long kid = [ids[0] unsignedLongValue];
+                return ((float (*)(id, SEL, unsigned long))[client methodForSelector:selGet])(client, selGet, kid);
+            }
+        }
         if ([client respondsToSelector:selGet]) {
             return ((float (*)(id, SEL, unsigned long))[client methodForSelector:selGet])(client, selGet, 1);
         }
@@ -137,15 +149,32 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 - (void)setKeyboardBrightness:(float)val {
     id client = [self getKeyboardClient];
     if (client) {
+        SEL selCopy = @selector(copyKeyboardBacklightIDs);
         SEL selSet = @selector(setBrightness:forKeyboard:);
         SEL selSetAuto = @selector(enableAutoBrightness:forKeyboard:);
 
-        if ([client respondsToSelector:selSetAuto]) {
-            ((BOOL (*)(id, SEL, BOOL, unsigned long))[client methodForSelector:selSetAuto])(client, selSetAuto, NO, 1);
+        NSArray *ids = nil;
+        if ([client respondsToSelector:selCopy]) {
+            ids = ((id (*)(id, SEL))[client methodForSelector:selCopy])(client, selCopy);
         }
 
-        if ([client respondsToSelector:selSet]) {
-            ((void (*)(id, SEL, float, unsigned long))[client methodForSelector:selSet])(client, selSet, val, 1);
+        if (ids && ids.count > 0) {
+            for (NSNumber *nid in ids) {
+                unsigned long kid = [nid unsignedLongValue];
+                if ([client respondsToSelector:selSetAuto]) {
+                    ((BOOL (*)(id, SEL, BOOL, unsigned long))[client methodForSelector:selSetAuto])(client, selSetAuto, NO, kid);
+                }
+                if ([client respondsToSelector:selSet]) {
+                    ((void (*)(id, SEL, float, unsigned long))[client methodForSelector:selSet])(client, selSet, val, kid);
+                }
+            }
+        } else {
+            if ([client respondsToSelector:selSetAuto]) {
+                ((BOOL (*)(id, SEL, BOOL, unsigned long))[client methodForSelector:selSetAuto])(client, selSetAuto, NO, 1);
+            }
+            if ([client respondsToSelector:selSet]) {
+                ((void (*)(id, SEL, float, unsigned long))[client methodForSelector:selSet])(client, selSet, val, 1);
+            }
         }
     }
 }
@@ -178,48 +207,49 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 }
 
 - (void)checkClamshellAndBacklights {
-    if (!self.isAwake) {
+    BOOL closed = [self isLidClosed];
+
+    if (!closed) {
         if (self.wasDimmedForClamshell) {
+            // Lid reopened after being dimmed!
             [self restoreBrightness];
+        } else {
+            // While lid is open and active, continuously track user's real brightness levels
+            float curD = [self currentDisplayBrightness];
+            float curK = [self currentKeyboardBrightness];
+            if (curD > 0.05f) {
+                self.savedDisplayBrightness = curD;
+            }
+            if (curK > 0.01f) {
+                self.savedKeyboardBrightness = curK;
+            }
         }
         return;
     }
 
-    BOOL closed = [self isLidClosed];
-    if (closed && !self.wasDimmedForClamshell) {
-        // Lid just shut while FoldAwake is active!
-        float curD = [self currentDisplayBrightness];
-        float curK = [self currentKeyboardBrightness];
-
-        if (curD > 0.05f) {
-            self.savedDisplayBrightness = curD;
-        } else {
-            self.savedDisplayBrightness = 0.8f;
-        }
-
-        if (curK > 0.0f) {
-            self.savedKeyboardBrightness = curK;
-        } else {
-            self.savedKeyboardBrightness = 0.4f;
-        }
-
+    // If lid is closed and FoldAwake is active:
+    if (self.isAwake && !self.wasDimmedForClamshell) {
+        // Clamshell closed! Dim display and keyboard to 0%
         [self setDisplayBrightness:0.0f];
         [self setKeyboardBrightness:0.0f];
         self.wasDimmedForClamshell = YES;
-    } else if (!closed && self.wasDimmedForClamshell) {
-        // Lid reopened!
-        [self restoreBrightness];
     }
 }
 
 - (void)restoreBrightness {
     if (self.wasDimmedForClamshell) {
         float targetD = (self.savedDisplayBrightness > 0.05f) ? self.savedDisplayBrightness : 0.8f;
-        float targetK = (self.savedKeyboardBrightness > 0.0f) ? self.savedKeyboardBrightness : 0.4f;
+        float targetK = (self.savedKeyboardBrightness > 0.01f) ? self.savedKeyboardBrightness : 0.5f;
 
         [self setDisplayBrightness:targetD];
         [self setKeyboardBrightness:targetK];
         self.wasDimmedForClamshell = NO;
+
+        // Re-assert brightness after 0.35s to prevent macOS ambient sensor daemon from overriding
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self setDisplayBrightness:targetD];
+            [self setKeyboardBrightness:targetK];
+        });
     }
 }
 
@@ -278,6 +308,10 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
     });
 }
 
+- (void)openFeedback {
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://github.com/alaska14/foldawake/issues"]];
+}
+
 - (void)showMenu {
     NSMenu *menu = [[NSMenu alloc] init];
     menu.autoenablesItems = NO;
@@ -300,6 +334,10 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 
     [menu addItem:[NSMenuItem separatorItem]];
 
+    NSMenuItem *feedbackItem = [[NSMenuItem alloc] initWithTitle:@"💬 Send Feedback / Feature Request..." action:@selector(openFeedback) keyEquivalent:@""];
+    feedbackItem.target = self;
+    [menu addItem:feedbackItem];
+
     NSMenuItem *aboutItem = [[NSMenuItem alloc] initWithTitle:@"About FoldAwake" action:@selector(showAbout) keyEquivalent:@""];
     aboutItem.target = self;
     [menu addItem:aboutItem];
@@ -315,7 +353,7 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 
 - (void)showAbout {
     NSAlert *about = [[NSAlert alloc] init];
-    about.messageText = @"FoldAwake 1.1";
+    about.messageText = @"FoldAwake 1.1.2";
     about.informativeText = @"Zero-bloat clamshell mode toggle, auto display/keyboard dimmer, external disk ejector, and runaway background battery protector for macOS.\n\nCrafted with native AppKit for 0.0% CPU and zero battery impact.";
     [about addButtonWithTitle:@"OK"];
     [NSApp activateIgnoringOtherApps:YES];
