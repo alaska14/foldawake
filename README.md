@@ -2,10 +2,10 @@
   <img src="docs/assets/FoldAwake-Cover-1280x720.png" alt="FoldAwake Banner" width="800">
   <br><br>
   
-  [![Gumroad](https://img.shields.io/badge/Get_FoldAwake-Gumroad_%242.99+-102039?style=for-the-badge&logo=gumroad&logoColor=white)](https://modolabs.gumroad.com/l/ttmmisw)
+  [![Support on Gumroad](https://img.shields.io/badge/Support_on_Gumroad-%242.99+-102039?style=for-the-badge&logo=gumroad&logoColor=white)](https://modolabs.gumroad.com/l/ttmmisw)
+  [![Free Release](https://img.shields.io/badge/Download-Free_DMG-success?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alaska14/foldawake/releases/latest)
   [![AlternativeTo](https://img.shields.io/badge/AlternativeTo-Listed-blue?style=for-the-badge)](https://alternativeto.net/software/foldawake/)
-  [![macOS](https://img.shields.io/badge/macOS-Monterey_to_Sequoia-gray?style=for-the-badge&logo=apple&logoColor=white)](https://modolabs.gumroad.com/l/ttmmisw)
-  [![Arch](https://img.shields.io/badge/Architecture-Universal_Binary_(Apple_Silicon_+_Intel)-success?style=for-the-badge)](https://modolabs.gumroad.com/l/ttmmisw)
+  [![Homebrew](https://img.shields.io/badge/Homebrew-Available-orange?style=for-the-badge&logo=homebrew&logoColor=white)](#option-2-homebrew-free)
 </div>
 
 <br>
@@ -32,20 +32,19 @@ macOS normally puts your laptop to sleep the moment you shut the lid unless you'
 
 ---
 
-## 📦 Download & Installation
+## 📦 Installation
 
-FoldAwake is distributed directly outside the Mac App Store as a signed Universal Binary:
+### Option 1: Homebrew (Free)
+```bash
+brew tap alaska14/tap
+brew install --cask foldawake
+```
 
-1. **[Download FoldAwake on Gumroad ($2.99+)](https://modolabs.gumroad.com/l/ttmmisw)**
-2. Open the downloaded `FoldAwake-1.0.dmg`.
-3. Drag `FoldAwake.app` into your Applications folder.
-4. Click the clamshell icon in your menu bar anytime to toggle!
+### Option 2: Download Free DMG
+Download the signed DMG directly from **[GitHub Releases](https://github.com/alaska14/foldawake/releases/latest)**.
 
----
-
-## 🛡️ 30-Day Money-Back Guarantee
-
-If FoldAwake does not perform flawlessly on your specific Mac hardware setup, simply send an email for an instant 100% refund, no questions asked.
+### Option 3: Support Development on Gumroad
+If you love FoldAwake and want to support indie Mac development, you can pay what you want on **[Gumroad (modolabs.gumroad.com/l/ttmmisw)](https://modolabs.gumroad.com/l/ttmmisw)**!
 
 ---
 
