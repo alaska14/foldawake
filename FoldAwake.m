@@ -23,8 +23,11 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [self checkAuthorizationOnLaunch];
 
+    // Load CoreBrightness framework for keyboard illumination control
+    [[NSBundle bundleWithPath:@"/System/Library/PrivateFrameworks/CoreBrightness.framework"] load];
+
     self.savedDisplayBrightness = 0.8f;
-    self.savedKeyboardBrightness = 0.3f;
+    self.savedKeyboardBrightness = 0.4f;
     self.wasDimmedForClamshell = NO;
 
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
@@ -111,6 +114,7 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 
 - (id)getKeyboardClient {
     if (!self.keyboardClient) {
+        [[NSBundle bundleWithPath:@"/System/Library/PrivateFrameworks/CoreBrightness.framework"] load];
         Class kbc = NSClassFromString(@"KeyboardBrightnessClient");
         if (kbc) {
             self.keyboardClient = [[kbc alloc] init];
@@ -134,6 +138,12 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
     id client = [self getKeyboardClient];
     if (client) {
         SEL selSet = @selector(setBrightness:forKeyboard:);
+        SEL selSetAuto = @selector(enableAutoBrightness:forKeyboard:);
+
+        if ([client respondsToSelector:selSetAuto]) {
+            ((BOOL (*)(id, SEL, BOOL, unsigned long))[client methodForSelector:selSetAuto])(client, selSetAuto, NO, 1);
+        }
+
         if ([client respondsToSelector:selSet]) {
             ((void (*)(id, SEL, float, unsigned long))[client methodForSelector:selSet])(client, selSet, val, 1);
         }
@@ -186,7 +196,12 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
         } else {
             self.savedDisplayBrightness = 0.8f;
         }
-        self.savedKeyboardBrightness = curK;
+
+        if (curK > 0.0f) {
+            self.savedKeyboardBrightness = curK;
+        } else {
+            self.savedKeyboardBrightness = 0.4f;
+        }
 
         [self setDisplayBrightness:0.0f];
         [self setKeyboardBrightness:0.0f];
@@ -200,8 +215,10 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 - (void)restoreBrightness {
     if (self.wasDimmedForClamshell) {
         float targetD = (self.savedDisplayBrightness > 0.05f) ? self.savedDisplayBrightness : 0.8f;
+        float targetK = (self.savedKeyboardBrightness > 0.0f) ? self.savedKeyboardBrightness : 0.4f;
+
         [self setDisplayBrightness:targetD];
-        [self setKeyboardBrightness:self.savedKeyboardBrightness];
+        [self setKeyboardBrightness:targetK];
         self.wasDimmedForClamshell = NO;
     }
 }
@@ -334,7 +351,7 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
     });
 }
 
-#pragma mark - Smooth Rounded Notch Clamshell Drawing
+#pragma mark - Option 1: Clean Clamshell Outline (Active = 100% White, Inactive = 35% Dimmed Gray)
 
 - (NSImage *)drawClamshellIconActive:(BOOL)active {
     NSSize size = NSMakeSize(18, 14);
@@ -352,91 +369,49 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
     CGFloat yLower = 5.8;
     CGFloat yNotch = 4.4;
 
-    [[NSColor blackColor] set];
+    // Active: Full 100% contrast crisp white
+    // Inactive: Subtle 35% translucent dimmed gray
+    CGFloat alpha = active ? 1.0f : 0.35f;
+    [[NSColor colorWithCalibratedWhite:0.0 alpha:alpha] set];
 
-    if (!active) {
-        NSBezierPath *frame = [NSBezierPath bezierPathWithRoundedRect:frameRect xRadius:radius yRadius:radius];
-        [frame setLineWidth:strokeW];
-        [frame stroke];
+    // Clamshell outer rounded frame
+    NSBezierPath *frame = [NSBezierPath bezierPathWithRoundedRect:frameRect xRadius:radius yRadius:radius];
+    [frame setLineWidth:strokeW];
+    [frame stroke];
 
-        NSBezierPath *band = [NSBezierPath bezierPath];
-        [band moveToPoint:NSMakePoint(frameRect.origin.x, yUpper)];
-        [band lineToPoint:NSMakePoint(NSMaxX(frameRect), yUpper)];
-        [band lineToPoint:NSMakePoint(NSMaxX(frameRect), yLower)];
-        [band lineToPoint:NSMakePoint(13.6, yLower)];
+    // Notch seam
+    NSBezierPath *band = [NSBezierPath bezierPath];
+    [band moveToPoint:NSMakePoint(frameRect.origin.x, yUpper)];
+    [band lineToPoint:NSMakePoint(NSMaxX(frameRect), yUpper)];
+    [band lineToPoint:NSMakePoint(NSMaxX(frameRect), yLower)];
+    [band lineToPoint:NSMakePoint(13.6, yLower)];
 
-        // Top right smooth curve
-        [band curveToPoint:NSMakePoint(12.7, 5.0)
-             controlPoint1:NSMakePoint(13.2, yLower)
-             controlPoint2:NSMakePoint(12.9, 5.4)];
+    // Top right smooth curve
+    [band curveToPoint:NSMakePoint(12.7, 5.0)
+         controlPoint1:NSMakePoint(13.2, yLower)
+         controlPoint2:NSMakePoint(12.9, 5.4)];
 
-        // Bottom right smooth curve
-        [band curveToPoint:NSMakePoint(11.7, yNotch)
-             controlPoint1:NSMakePoint(12.5, yNotch)
-             controlPoint2:NSMakePoint(12.1, yNotch)];
+    // Bottom right smooth curve
+    [band curveToPoint:NSMakePoint(11.7, yNotch)
+         controlPoint1:NSMakePoint(12.5, yNotch)
+         controlPoint2:NSMakePoint(12.1, yNotch)];
 
-        // Flat notch bottom
-        [band lineToPoint:NSMakePoint(6.3, yNotch)];
+    // Flat notch bottom
+    [band lineToPoint:NSMakePoint(6.3, yNotch)];
 
-        // Bottom left smooth curve
-        [band curveToPoint:NSMakePoint(5.3, 5.0)
-             controlPoint1:NSMakePoint(5.9, yNotch)
-             controlPoint2:NSMakePoint(5.5, yNotch)];
+    // Bottom left smooth curve
+    [band curveToPoint:NSMakePoint(5.3, 5.0)
+         controlPoint1:NSMakePoint(5.9, yNotch)
+         controlPoint2:NSMakePoint(5.5, yNotch)];
 
-        // Top left smooth curve
-        [band curveToPoint:NSMakePoint(4.4, yLower)
-             controlPoint1:NSMakePoint(5.1, 5.4)
-             controlPoint2:NSMakePoint(4.8, yLower)];
+    // Top left smooth curve
+    [band curveToPoint:NSMakePoint(4.4, yLower)
+         controlPoint1:NSMakePoint(5.1, 5.4)
+         controlPoint2:NSMakePoint(4.8, yLower)];
 
-        [band lineToPoint:NSMakePoint(frameRect.origin.x, yLower)];
-        [band closePath];
-
-        [band fill];
-    } else {
-        NSBezierPath *frame = [NSBezierPath bezierPathWithRoundedRect:frameRect xRadius:radius yRadius:radius];
-        [frame setLineWidth:strokeW];
-        [frame stroke];
-
-        NSBezierPath *topFill = [NSBezierPath bezierPath];
-        CGFloat topY = NSMaxY(frameRect);
-        CGFloat leftX = frameRect.origin.x;
-        CGFloat rightX = NSMaxX(frameRect);
-
-        [topFill moveToPoint:NSMakePoint(leftX, yLower)];
-        [topFill lineToPoint:NSMakePoint(leftX, topY - radius)];
-        [topFill curveToPoint:NSMakePoint(leftX + radius, topY)
-                controlPoint1:NSMakePoint(leftX, topY - radius * 0.45)
-                controlPoint2:NSMakePoint(leftX + radius * 0.45, topY)];
-        [topFill lineToPoint:NSMakePoint(rightX - radius, topY)];
-        [topFill curveToPoint:NSMakePoint(rightX, topY - radius)
-                controlPoint1:NSMakePoint(rightX - radius * 0.45, topY)
-                controlPoint2:NSMakePoint(rightX, topY - radius * 0.45)];
-        [topFill lineToPoint:NSMakePoint(rightX, yLower)];
-        [topFill lineToPoint:NSMakePoint(13.6, yLower)];
-
-        [topFill curveToPoint:NSMakePoint(12.7, 5.0)
-                controlPoint1:NSMakePoint(13.2, yLower)
-                controlPoint2:NSMakePoint(12.9, 5.4)];
-
-        [topFill curveToPoint:NSMakePoint(11.7, yNotch)
-                controlPoint1:NSMakePoint(12.5, yNotch)
-                controlPoint2:NSMakePoint(12.1, yNotch)];
-
-        [topFill lineToPoint:NSMakePoint(6.3, yNotch)];
-
-        [topFill curveToPoint:NSMakePoint(5.3, 5.0)
-                controlPoint1:NSMakePoint(5.9, yNotch)
-                controlPoint2:NSMakePoint(5.5, yNotch)];
-
-        [topFill curveToPoint:NSMakePoint(4.4, yLower)
-                controlPoint1:NSMakePoint(5.1, 5.4)
-                controlPoint2:NSMakePoint(4.8, yLower)];
-
-        [topFill lineToPoint:NSMakePoint(leftX, yLower)];
-        [topFill closePath];
-
-        [topFill fill];
-    }
+    [band lineToPoint:NSMakePoint(frameRect.origin.x, yLower)];
+    [band closePath];
+    [band fill];
 
     [image unlockFocus];
     [image setTemplate:YES];
