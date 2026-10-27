@@ -32,19 +32,20 @@ macOS normally puts your laptop to sleep the moment you shut the lid unless you'
 
 ---
 
-## 📦 Installation
+## 📦 Download & Installation
 
-### Option 1: Official Installer (Recommended)
-Download the signed DMG package from **[Gumroad (modolabs.gumroad.com/l/ttmmisw)](https://modolabs.gumroad.com/l/ttmmisw)**:
-1. Open `FoldAwake-1.0.dmg`.
-2. Drag `FoldAwake.app` into Applications.
-3. Launch and click the menu bar clamshell icon anytime to toggle!
+FoldAwake is distributed directly outside the Mac App Store as a signed Universal Binary:
 
-### Option 2: Homebrew
-```bash
-brew tap alaska14/tap
-brew install --cask foldawake
-```
+1. **[Download FoldAwake on Gumroad ($2.99+)](https://modolabs.gumroad.com/l/ttmmisw)**
+2. Open the downloaded `FoldAwake-1.0.dmg`.
+3. Drag `FoldAwake.app` into your Applications folder.
+4. Click the clamshell icon in your menu bar anytime to toggle!
+
+---
+
+## 🛡️ 30-Day Money-Back Guarantee
+
+If FoldAwake does not perform flawlessly on your specific Mac hardware setup, simply send an email for an instant 100% refund, no questions asked.
 
 ---
 
