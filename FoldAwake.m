@@ -39,6 +39,7 @@ extern double IOHIDEventGetFloatValue(IOHIDEventRef event, int32_t field);
 // Thermal Guardian State
 @property (strong, nonatomic) NSTimer *thermalCheckTimer;
 @property (assign, nonatomic) BOOL isThermalSleepOverruled;
+@property (assign, nonatomic) int consecutiveDangerChecks;
 @property (strong, nonatomic) NSString *lastThermalAbnormality;
 @property (strong, nonatomic) NSDate *lastThermalTripDate;
 
@@ -359,6 +360,7 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
 - (void)startThermalMonitoring {
     [self stopThermalMonitoring];
+    self.consecutiveDangerChecks = 0;
     // Immediate initial check upon folding shut
     [self runThermalCheck];
     // Check every 10 seconds while folded shut (~0.003% CPU overhead, purely in-memory IOKit)
@@ -374,6 +376,7 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
         [self.thermalCheckTimer invalidate];
         self.thermalCheckTimer = nil;
     }
+    self.consecutiveDangerChecks = 0;
 }
 
 - (void)runThermalCheck {
@@ -383,10 +386,27 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
     NSString *reason = nil;
     double peak = 0.0;
-    BOOL abnormal = [self checkThermalAbnormalities:&reason peakTemp:&peak];
+    BOOL danger = [self checkThermalAbnormalities:&reason peakTemp:&peak];
 
-    if (abnormal) {
-        [self triggerEmergencyThermalSleepWithReason:reason peakTemp:peak];
+    if (danger) {
+        self.consecutiveDangerChecks++;
+        NSLog(@"[FoldAwake ThermalGuardian] Warning: Near-unsafe thermal level detected (%@, Peak: %.1f°C). Strike %d/2.", reason, peak, self.consecutiveDangerChecks);
+
+        // Immediate emergency if battery exceeds 52°C or core exceeds 104°C
+        BOOL isExtremeEmergency = (peak >= 104.0);
+        if ([reason containsString:@"Battery"] && peak >= 52.0) {
+            isExtremeEmergency = YES;
+        }
+
+        // Require 2 consecutive checks (sustained heat runaway) to avoid 1-second burst false positives
+        if (self.consecutiveDangerChecks >= 2 || isExtremeEmergency) {
+            [self triggerEmergencyThermalSleepWithReason:reason peakTemp:peak];
+        }
+    } else {
+        if (self.consecutiveDangerChecks > 0) {
+            NSLog(@"[FoldAwake ThermalGuardian] Temperature normalized (Peak: %.1f°C). Danger counter reset.", peak);
+        }
+        self.consecutiveDangerChecks = 0;
     }
 }
 
@@ -411,10 +431,11 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
 - (BOOL)checkThermalAbnormalities:(NSString **)outReason peakTemp:(double *)outPeak {
     // 1. Check OS Kernel Thermal State
+    // Only trigger on Critical (cooling capacity fully exhausted, hardware emergency)
+    // Fair/Serious are normal during heavy workloads and are allowed.
     NSProcessInfoThermalState osState = [[NSProcessInfo processInfo] thermalState];
-    if (osState >= NSProcessInfoThermalStateSerious) {
-        NSString *s = (osState == NSProcessInfoThermalStateCritical) ? @"Critical (Kernel Throttling Active)" : @"Serious (Cooling Capacity Exceeded)";
-        if (outReason) *outReason = [NSString stringWithFormat:@"System Thermal State: %@", s];
+    if (osState >= NSProcessInfoThermalStateCritical) {
+        if (outReason) *outReason = @"macOS Kernel Thermal State reached Critical";
         return YES;
     }
 
@@ -435,8 +456,8 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
     CFIndex count = CFArrayGetCount(services);
     double peak = 0.0;
-    BOOL abnormal = NO;
-    NSString *abnormalReason = nil;
+    BOOL danger = NO;
+    NSString *dangerReason = nil;
 
     for (CFIndex i = 0; i < count; i++) {
         IOHIDServiceClientRef s = (IOHIDServiceClientRef)CFArrayGetValueAtIndex(services, i);
@@ -461,35 +482,38 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
                     peak = temp;
                 }
 
-                // Threshold 1: Battery (Li-ion degrades rapidly above 45°C. Critical limit = 48°C)
+                // Threshold 1: Battery (Li-ion chemical danger limit is 50°C; BMS cutoff is 55°C)
+                // Bag heat is totally acceptable up to 45-49°C. Only trigger at genuine unsafe limit >= 50.0°C.
                 if ([lower containsString:@"battery"] || [lower containsString:@"gas gauge"]) {
-                    if (temp >= 48.0) {
-                        abnormal = YES;
-                        abnormalReason = [NSString stringWithFormat:@"Battery reached %.1f°C (%@)", temp, name];
+                    if (temp >= 50.0) {
+                        danger = YES;
+                        dangerReason = [NSString stringWithFormat:@"Battery reached %.1f°C (%@)", temp, name];
                         break;
                     }
                 }
-                // Threshold 2: SoC / CPU / GPU Core Dies (In closed clamshell, sustained temps > 88°C risk display heat damage)
+                // Threshold 2: SoC / CPU / GPU Core Dies (TjMax is 106-108°C)
+                // Heavy tasks in a bag can run hot at 85-95°C safely. Only intervene if approaching silicon shutdown >= 98.0°C.
                 else if ([lower containsString:@"tdie"] || [lower containsString:@"soc"] || [lower containsString:@"cpu"] || [lower containsString:@"gpu"]) {
-                    if (temp >= 88.0) {
-                        abnormal = YES;
-                        abnormalReason = [NSString stringWithFormat:@"Core Die reached %.1f°C (%@)", temp, name];
+                    if (temp >= 98.0) {
+                        danger = YES;
+                        dangerReason = [NSString stringWithFormat:@"SoC Core Die reached %.1f°C (%@)", temp, name];
                         break;
                     }
                 }
-                // Threshold 3: Board / NAND Storage (Max safe closed temp: 75°C)
+                // Threshold 3: Board / NAND Storage / Chassis (Display panel adhesive begins degrading at 65-70°C)
+                // Allow warm bag operation up to 67°C. Only trigger if heat-soak reaches >= 68.0°C.
                 else if ([lower containsString:@"nand"] || [lower containsString:@"tdev"]) {
-                    if (temp >= 75.0) {
-                        abnormal = YES;
-                        abnormalReason = [NSString stringWithFormat:@"Chassis/NAND reached %.1f°C (%@)", temp, name];
+                    if (temp >= 68.0) {
+                        danger = YES;
+                        dangerReason = [NSString stringWithFormat:@"Chassis/NAND heat-soak reached %.1f°C (%@)", temp, name];
                         break;
                     }
                 }
                 // Threshold 4: General hardware sensor limit
                 else {
-                    if (temp >= 85.0) {
-                        abnormal = YES;
-                        abnormalReason = [NSString stringWithFormat:@"Hardware sensor reached %.1f°C (%@)", temp, name];
+                    if (temp >= 95.0) {
+                        danger = YES;
+                        dangerReason = [NSString stringWithFormat:@"Hardware sensor reached %.1f°C (%@)", temp, name];
                         break;
                     }
                 }
@@ -501,9 +525,9 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     CFRelease(client);
 
     if (outPeak) *outPeak = peak;
-    if (abnormal && outReason) *outReason = abnormalReason;
+    if (danger && outReason) *outReason = dangerReason;
 
-    return abnormal;
+    return danger;
 }
 
 - (double)currentPeakTemperature {
