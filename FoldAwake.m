@@ -1,5 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
+#import <IOKit/pwr_mgt/IOPM.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 #import <unistd.h>
 #import <signal.h>
 
@@ -8,15 +10,25 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property (strong, nonatomic) NSStatusItem *statusItem;
-@property (strong, nonatomic) NSTimer *timer;
-@property (strong, nonatomic) NSTimer *watchdogTimer;
-@property (strong, nonatomic) NSTimer *clamshellTimer;
+@property (strong, nonatomic) NSTimer *brightnessCacheTimer;
 @property (assign, nonatomic) BOOL isAwake;
 @property (assign, nonatomic) BOOL wasDimmedForClamshell;
 @property (assign, nonatomic) float savedDisplayBrightness;
 @property (assign, nonatomic) float savedKeyboardBrightness;
 @property (strong, nonatomic) id keyboardClient;
+@property (assign, nonatomic) IOPMAssertionID sleepAssertionID;
+@property (assign, nonatomic) IOPMAssertionID idleAssertionID;
+@property (assign, nonatomic) IONotificationPortRef notifyPort;
+@property (assign, nonatomic) io_object_t notifier;
+- (void)handleClamshellChanged;
 @end
+
+static void powerNotificationCallback(void *refCon, io_service_t service, natural_t messageType, void *messageArgument) {
+    if (messageType == kIOPMMessageClamshellStateChange) {
+        AppDelegate *delegate = (__bridge AppDelegate *)refCon;
+        [delegate handleClamshellChanged];
+    }
+}
 
 @implementation AppDelegate
 
@@ -26,26 +38,59 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
     // Load CoreBrightness framework for keyboard illumination control
     [[NSBundle bundleWithPath:@"/System/Library/PrivateFrameworks/CoreBrightness.framework"] load];
 
+    self.sleepAssertionID = kIOPMNullAssertionID;
+    self.idleAssertionID = kIOPMNullAssertionID;
+    self.wasDimmedForClamshell = NO;
+
     self.savedDisplayBrightness = [self currentDisplayBrightness];
     if (self.savedDisplayBrightness <= 0.05f) self.savedDisplayBrightness = 0.8f;
 
+    // Record user's exact keyboard brightness (including 0.0f if turned off)
     self.savedKeyboardBrightness = [self currentKeyboardBrightness];
-    if (self.savedKeyboardBrightness <= 0.01f) self.savedKeyboardBrightness = 0.5f;
 
-    self.wasDimmedForClamshell = NO;
-
+    // Set up Status Item
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
     self.statusItem.button.target = self;
     self.statusItem.button.action = @selector(statusItemClicked:);
     [self.statusItem.button sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)];
 
-    [self updateStateFromSystem];
+    // Check system state ONCE at launch (zero recurring popen!)
+    self.isAwake = [self checkSleepDisabled];
+    if (self.isAwake) {
+        [self acquireSleepAssertions];
+    }
+    [self updateIcon];
 
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(updateStateFromSystem) userInfo:nil repeats:YES];
-    self.watchdogTimer = [NSTimer scheduledTimerWithTimeInterval:120.0 target:self selector:@selector(reapRunawayZombies) userInfo:nil repeats:YES];
-    self.clamshellTimer = [NSTimer scheduledTimerWithTimeInterval:0.4 target:self selector:@selector(checkClamshellAndBacklights) userInfo:nil repeats:YES];
-    
-    [self reapRunawayZombies];
+    // Register 100% event-driven IOKit clamshell notification (0.0% CPU, NO POLLING!)
+    [self registerClamshellNotification];
+
+    // Passive low-overhead brightness check (every 15s, purely in-memory, zero subshells)
+    self.brightnessCacheTimer = [NSTimer scheduledTimerWithTimeInterval:15.0 target:self selector:@selector(cacheActiveBrightness) userInfo:nil repeats:YES];
+}
+
+#pragma mark - IOKit Event Notification (Zero CPU)
+
+- (void)registerClamshellNotification {
+    self.notifyPort = IONotificationPortCreate(kIOMainPortDefault);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), IONotificationPortGetRunLoopSource(self.notifyPort), kCFRunLoopDefaultMode);
+
+    io_service_t rootDomain = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
+    if (rootDomain) {
+        io_object_t notif;
+        IOServiceAddInterestNotification(self.notifyPort, rootDomain, kIOGeneralInterest, powerNotificationCallback, (__bridge void *)self, &notif);
+        self.notifier = notif;
+        IOObjectRelease(rootDomain);
+    }
+}
+
+- (void)cacheActiveBrightness {
+    if (!self.wasDimmedForClamshell && ![self isLidClosed]) {
+        float curD = [self currentDisplayBrightness];
+        float curK = [self currentKeyboardBrightness];
+        if (curD > 0.05f) self.savedDisplayBrightness = curD;
+        // Reliably record keyboard brightness, including 0.0f
+        self.savedKeyboardBrightness = curK;
+    }
 }
 
 #pragma mark - Permissions / Authorization
@@ -86,7 +131,7 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
     }
 }
 
-#pragma mark - State Management
+#pragma mark - State Management & Assertions
 
 - (BOOL)checkSleepDisabled {
     FILE *fp = popen("/usr/bin/pmset -g", "r");
@@ -103,15 +148,41 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
     return disabled;
 }
 
-- (void)updateStateFromSystem {
-    BOOL current = [self checkSleepDisabled];
-    if (current != self.isAwake || self.statusItem.button.image == nil) {
-        self.isAwake = current;
-        NSImage *icon = [self drawClamshellIconActive:self.isAwake];
-        [icon setTemplate:YES];
-        self.statusItem.button.image = icon;
-        self.statusItem.button.toolTip = self.isAwake ? @"FoldAwake: Active (Mac stays awake with lid closed)" : @"FoldAwake: Inactive (Normal sleep)";
+- (void)acquireSleepAssertions {
+    if (self.sleepAssertionID == kIOPMNullAssertionID) {
+        IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventSystemSleep,
+            kIOPMAssertionLevelOn,
+            CFSTR("FoldAwake Clamshell Mode"),
+            &_sleepAssertionID
+        );
     }
+    if (self.idleAssertionID == kIOPMNullAssertionID) {
+        IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep,
+            kIOPMAssertionLevelOn,
+            CFSTR("FoldAwake Clamshell Mode"),
+            &_idleAssertionID
+        );
+    }
+}
+
+- (void)releaseSleepAssertions {
+    if (self.sleepAssertionID != kIOPMNullAssertionID) {
+        IOPMAssertionRelease(self.sleepAssertionID);
+        self.sleepAssertionID = kIOPMNullAssertionID;
+    }
+    if (self.idleAssertionID != kIOPMNullAssertionID) {
+        IOPMAssertionRelease(self.idleAssertionID);
+        self.idleAssertionID = kIOPMNullAssertionID;
+    }
+}
+
+- (void)updateIcon {
+    NSImage *icon = [self drawClamshellIconActive:self.isAwake];
+    [icon setTemplate:YES];
+    self.statusItem.button.image = icon;
+    self.statusItem.button.toolTip = self.isAwake ? @"FoldAwake: Active (Mac stays awake with lid closed)" : @"FoldAwake: Inactive (Normal sleep)";
 }
 
 #pragma mark - Smart Clamshell Display & Keyboard Auto-Dimming
@@ -161,6 +232,7 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
         if (ids && ids.count > 0) {
             for (NSNumber *nid in ids) {
                 unsigned long kid = [nid unsignedLongValue];
+                // Disable auto-brightness so macOS ambient light sensor doesn't bump a 0% keyboard back to 20%
                 if ([client respondsToSelector:selSetAuto]) {
                     ((BOOL (*)(id, SEL, BOOL, unsigned long))[client methodForSelector:selSetAuto])(client, selSetAuto, NO, kid);
                 }
@@ -206,46 +278,37 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
     return isClosed;
 }
 
-- (void)checkClamshellAndBacklights {
+- (void)handleClamshellChanged {
     BOOL closed = [self isLidClosed];
 
     if (!closed) {
         if (self.wasDimmedForClamshell) {
-            // Lid reopened after being dimmed!
             [self restoreBrightness];
-        } else {
-            // While lid is open and active, continuously track user's real brightness levels
-            float curD = [self currentDisplayBrightness];
-            float curK = [self currentKeyboardBrightness];
-            if (curD > 0.05f) {
-                self.savedDisplayBrightness = curD;
-            }
-            if (curK > 0.01f) {
-                self.savedKeyboardBrightness = curK;
-            }
         }
-        return;
-    }
+    } else {
+        if (self.isAwake && !self.wasDimmedForClamshell) {
+            // Lid just shut while active! Dim display & keyboard to 0%
+            [self setDisplayBrightness:0.0f];
+            [self setKeyboardBrightness:0.0f];
+            self.wasDimmedForClamshell = YES;
 
-    // If lid is closed and FoldAwake is active:
-    if (self.isAwake && !self.wasDimmedForClamshell) {
-        // Clamshell closed! Dim display and keyboard to 0%
-        [self setDisplayBrightness:0.0f];
-        [self setKeyboardBrightness:0.0f];
-        self.wasDimmedForClamshell = YES;
+            // Run zombie cleanup once when packed away
+            [self reapRunawayZombies];
+        }
     }
 }
 
 - (void)restoreBrightness {
     if (self.wasDimmedForClamshell) {
         float targetD = (self.savedDisplayBrightness > 0.05f) ? self.savedDisplayBrightness : 0.8f;
-        float targetK = (self.savedKeyboardBrightness > 0.01f) ? self.savedKeyboardBrightness : 0.5f;
+        // Restore user's exact keyboard level, staying at 0.0f if they chose to keep it off!
+        float targetK = self.savedKeyboardBrightness;
 
         [self setDisplayBrightness:targetD];
         [self setKeyboardBrightness:targetK];
         self.wasDimmedForClamshell = NO;
 
-        // Re-assert brightness after 0.35s to prevent macOS ambient sensor daemon from overriding
+        // Re-assert after 0.35s to prevent macOS ambient sensor from overriding
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [self setDisplayBrightness:targetD];
             [self setKeyboardBrightness:targetK];
@@ -270,15 +333,22 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
         if (![self hasSudoPermission]) return;
     }
 
+    [self cacheActiveBrightness];
+
     BOOL newState = !self.isAwake;
+    self.isAwake = newState;
+
     NSString *cmd = newState ? @"/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 1" : @"/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0";
     system([cmd UTF8String]);
 
-    if (!newState) {
+    if (newState) {
+        [self acquireSleepAssertions];
+    } else {
+        [self releaseSleepAssertions];
         [self restoreBrightness];
     }
 
-    [self updateStateFromSystem];
+    [self updateIcon];
 
     NSString *title = newState ? @"FoldAwake: Clamshell Active" : @"FoldAwake: Normal Sleep";
     NSString *body = newState ? @"Your Mac will stay awake with the lid closed (display & keys auto-dimmed)." : @"Your Mac will sleep normally when the lid is closed.";
@@ -313,6 +383,8 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 }
 
 - (void)showMenu {
+    [self cacheActiveBrightness];
+
     NSMenu *menu = [[NSMenu alloc] init];
     menu.autoenablesItems = NO;
 
@@ -361,11 +433,13 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 }
 
 - (void)quitApp {
+    [self releaseSleepAssertions];
     [self restoreBrightness];
     [NSApp terminate:nil];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [self releaseSleepAssertions];
     [self restoreBrightness];
 }
 
