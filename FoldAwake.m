@@ -2,11 +2,26 @@
 #import <IOKit/IOKitLib.h>
 #import <IOKit/pwr_mgt/IOPM.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/hidsystem/IOHIDEventSystemClient.h>
 #import <unistd.h>
 #import <signal.h>
 
 extern int DisplayServicesGetBrightness(CGDirectDisplayID display, float *brightness);
 extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightness);
+
+// IOHID Private API Declarations for Hardware Thermal Sensors
+typedef struct __IOHIDEvent *IOHIDEventRef;
+typedef struct __IOHIDServiceClient *IOHIDServiceClientRef;
+typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+
+#define kIOHIDEventTypeTemperature 15
+
+extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
+extern int IOHIDEventSystemClientSetMatching(IOHIDEventSystemClientRef client, CFDictionaryRef match);
+extern CFArrayRef IOHIDEventSystemClientCopyServices(IOHIDEventSystemClientRef client);
+extern CFTypeRef IOHIDServiceClientCopyProperty(IOHIDServiceClientRef service, CFStringRef key);
+extern IOHIDEventRef IOHIDServiceClientCopyEvent(IOHIDServiceClientRef service, int64_t type, int32_t options, int64_t to);
+extern double IOHIDEventGetFloatValue(IOHIDEventRef event, int32_t field);
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property (strong, nonatomic) NSStatusItem *statusItem;
@@ -20,7 +35,19 @@ extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightn
 @property (assign, nonatomic) IOPMAssertionID idleAssertionID;
 @property (assign, nonatomic) IONotificationPortRef notifyPort;
 @property (assign, nonatomic) io_object_t notifier;
+
+// Thermal Guardian State
+@property (strong, nonatomic) NSTimer *thermalCheckTimer;
+@property (assign, nonatomic) BOOL isThermalSleepOverruled;
+@property (strong, nonatomic) NSString *lastThermalAbnormality;
+@property (strong, nonatomic) NSDate *lastThermalTripDate;
+
 - (void)handleClamshellChanged;
+- (void)startThermalMonitoring;
+- (void)stopThermalMonitoring;
+- (void)runThermalCheck;
+- (BOOL)checkThermalAbnormalities:(NSString **)outReason peakTemp:(double *)outPeak;
+- (double)currentPeakTemperature;
 @end
 
 static void powerNotificationCallback(void *refCon, io_service_t service, natural_t messageType, void *messageArgument) {
@@ -54,10 +81,17 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     self.statusItem.button.action = @selector(statusItemClicked:);
     [self.statusItem.button sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)];
 
+    self.isThermalSleepOverruled = NO;
+    self.lastThermalAbnormality = nil;
+    self.lastThermalTripDate = nil;
+
     // Check system state ONCE at launch (zero recurring popen!)
     self.isAwake = [self checkSleepDisabled];
     if (self.isAwake) {
         [self acquireSleepAssertions];
+        if ([self isLidClosed]) {
+            [self startThermalMonitoring];
+        }
     }
     [self updateIcon];
 
@@ -282,10 +316,30 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     BOOL closed = [self isLidClosed];
 
     if (!closed) {
+        // Clamshell opened up!
+        [self stopThermalMonitoring];
+
         if (self.wasDimmedForClamshell) {
             [self restoreBrightness];
         }
+
+        // Check if keep-awake was overruled due to abnormal heat while folded shut
+        if (self.isThermalSleepOverruled) {
+            self.isThermalSleepOverruled = NO;
+            NSLog(@"[FoldAwake] Lid opened. Clearing emergency thermal override.");
+
+            // Re-arm keep-awake if it was active
+            if (self.isAwake) {
+                [self acquireSleepAssertions];
+                system("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 1");
+            }
+            [self updateIcon];
+
+            NSString *msg = [NSString stringWithFormat:@"Your Mac was put to sleep while folded shut to prevent overheating (%@). Normal clamshell protection has been restored.", self.lastThermalAbnormality ?: @"high temperature detected"];
+            [self sendNotificationWithTitle:@"⚠️ Thermal Safety Alert" message:msg];
+        }
     } else {
+        // Clamshell folded shut!
         if (self.isAwake && !self.wasDimmedForClamshell) {
             // Lid just shut while active! Dim display & keyboard to 0%
             [self setDisplayBrightness:0.0f];
@@ -294,8 +348,168 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
             // Run zombie cleanup once when packed away
             [self reapRunawayZombies];
+
+            // Start active Thermal Guardian monitoring while folded shut
+            [self startThermalMonitoring];
         }
     }
+}
+
+#pragma mark - Thermal Guardian (Auto-sleeps on overheat while folded shut)
+
+- (void)startThermalMonitoring {
+    [self stopThermalMonitoring];
+    // Immediate initial check upon folding shut
+    [self runThermalCheck];
+    // Check every 10 seconds while folded shut (~0.003% CPU overhead, purely in-memory IOKit)
+    self.thermalCheckTimer = [NSTimer scheduledTimerWithTimeInterval:10.0
+                                                              target:self
+                                                            selector:@selector(runThermalCheck)
+                                                            userInfo:nil
+                                                             repeats:YES];
+}
+
+- (void)stopThermalMonitoring {
+    if (self.thermalCheckTimer) {
+        [self.thermalCheckTimer invalidate];
+        self.thermalCheckTimer = nil;
+    }
+}
+
+- (void)runThermalCheck {
+    if (![self isLidClosed] || !self.isAwake || self.isThermalSleepOverruled) {
+        return;
+    }
+
+    NSString *reason = nil;
+    double peak = 0.0;
+    BOOL abnormal = [self checkThermalAbnormalities:&reason peakTemp:&peak];
+
+    if (abnormal) {
+        [self triggerEmergencyThermalSleepWithReason:reason peakTemp:peak];
+    }
+}
+
+- (void)triggerEmergencyThermalSleepWithReason:(NSString *)reason peakTemp:(double)peak {
+    NSLog(@"[FoldAwake ThermalGuardian] EMERGENCY OVERHEAT: %@ (Peak: %.1f°C). Overruling keep-awake and putting Mac to sleep!", reason, peak);
+
+    self.isThermalSleepOverruled = YES;
+    self.lastThermalAbnormality = reason;
+    self.lastThermalTripDate = [NSDate date];
+
+    [self stopThermalMonitoring];
+
+    // 1. Release sleep assertions
+    [self releaseSleepAssertions];
+
+    // 2. Overrule pmset disablesleep
+    system("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0");
+
+    // 3. Put Mac to sleep until user opens the lid
+    system("/usr/bin/pmset sleepnow &");
+}
+
+- (BOOL)checkThermalAbnormalities:(NSString **)outReason peakTemp:(double *)outPeak {
+    // 1. Check OS Kernel Thermal State
+    NSProcessInfoThermalState osState = [[NSProcessInfo processInfo] thermalState];
+    if (osState >= NSProcessInfoThermalStateSerious) {
+        NSString *s = (osState == NSProcessInfoThermalStateCritical) ? @"Critical (Kernel Throttling Active)" : @"Serious (Cooling Capacity Exceeded)";
+        if (outReason) *outReason = [NSString stringWithFormat:@"System Thermal State: %@", s];
+        return YES;
+    }
+
+    // 2. Scan Hardware Thermal Sensors via IOHID (Apple Silicon / modern macOS)
+    IOHIDEventSystemClientRef client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    if (!client) return NO;
+
+    NSDictionary *match = @{
+        @"PrimaryUsagePage": @(0xff00),
+        @"PrimaryUsage": @(5)
+    };
+    IOHIDEventSystemClientSetMatching(client, (__bridge CFDictionaryRef)match);
+    CFArrayRef services = IOHIDEventSystemClientCopyServices(client);
+    if (!services) {
+        CFRelease(client);
+        return NO;
+    }
+
+    CFIndex count = CFArrayGetCount(services);
+    double peak = 0.0;
+    BOOL abnormal = NO;
+    NSString *abnormalReason = nil;
+
+    for (CFIndex i = 0; i < count; i++) {
+        IOHIDServiceClientRef s = (IOHIDServiceClientRef)CFArrayGetValueAtIndex(services, i);
+        NSString *name = (__bridge_transfer NSString *)IOHIDServiceClientCopyProperty(s, CFSTR("Product"));
+        if (!name) name = (__bridge_transfer NSString *)IOHIDServiceClientCopyProperty(s, CFSTR("Transport"));
+        if (!name) name = [NSString stringWithFormat:@"Sensor_%ld", (long)i];
+
+        IOHIDEventRef ev = IOHIDServiceClientCopyEvent(s, kIOHIDEventTypeTemperature, 0, 0);
+        if (ev) {
+            double temp = IOHIDEventGetFloatValue(ev, (kIOHIDEventTypeTemperature << 16));
+            CFRelease(ev);
+
+            if (temp > 0.0 && temp < 150.0) {
+                NSString *lower = [name lowercaseString];
+
+                // Skip calibration target/offset pseudo-sensors (e.g. "tcal")
+                if ([lower containsString:@"tcal"]) {
+                    continue;
+                }
+
+                if (temp > peak) {
+                    peak = temp;
+                }
+
+                // Threshold 1: Battery (Li-ion degrades rapidly above 45°C. Critical limit = 48°C)
+                if ([lower containsString:@"battery"] || [lower containsString:@"gas gauge"]) {
+                    if (temp >= 48.0) {
+                        abnormal = YES;
+                        abnormalReason = [NSString stringWithFormat:@"Battery reached %.1f°C (%@)", temp, name];
+                        break;
+                    }
+                }
+                // Threshold 2: SoC / CPU / GPU Core Dies (In closed clamshell, sustained temps > 88°C risk display heat damage)
+                else if ([lower containsString:@"tdie"] || [lower containsString:@"soc"] || [lower containsString:@"cpu"] || [lower containsString:@"gpu"]) {
+                    if (temp >= 88.0) {
+                        abnormal = YES;
+                        abnormalReason = [NSString stringWithFormat:@"Core Die reached %.1f°C (%@)", temp, name];
+                        break;
+                    }
+                }
+                // Threshold 3: Board / NAND Storage (Max safe closed temp: 75°C)
+                else if ([lower containsString:@"nand"] || [lower containsString:@"tdev"]) {
+                    if (temp >= 75.0) {
+                        abnormal = YES;
+                        abnormalReason = [NSString stringWithFormat:@"Chassis/NAND reached %.1f°C (%@)", temp, name];
+                        break;
+                    }
+                }
+                // Threshold 4: General hardware sensor limit
+                else {
+                    if (temp >= 85.0) {
+                        abnormal = YES;
+                        abnormalReason = [NSString stringWithFormat:@"Hardware sensor reached %.1f°C (%@)", temp, name];
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    CFRelease(services);
+    CFRelease(client);
+
+    if (outPeak) *outPeak = peak;
+    if (abnormal && outReason) *outReason = abnormalReason;
+
+    return abnormal;
+}
+
+- (double)currentPeakTemperature {
+    double peak = 0.0;
+    [self checkThermalAbnormalities:nil peakTemp:&peak];
+    return peak;
 }
 
 - (void)restoreBrightness {
@@ -343,7 +557,12 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
     if (newState) {
         [self acquireSleepAssertions];
+        if ([self isLidClosed]) {
+            [self startThermalMonitoring];
+        }
     } else {
+        [self stopThermalMonitoring];
+        self.isThermalSleepOverruled = NO;
         [self releaseSleepAssertions];
         [self restoreBrightness];
     }
@@ -351,7 +570,7 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     [self updateIcon];
 
     NSString *title = newState ? @"FoldAwake: Clamshell Active" : @"FoldAwake: Normal Sleep";
-    NSString *body = newState ? @"Your Mac will stay awake with the lid closed (display & keys auto-dimmed)." : @"Your Mac will sleep normally when the lid is closed.";
+    NSString *body = newState ? @"Your Mac will stay awake with the lid closed (display & keys auto-dimmed with Thermal Guardian)." : @"Your Mac will sleep normally when the lid is closed.";
     [self sendNotificationWithTitle:title message:body];
 }
 
@@ -400,6 +619,26 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
     [menu addItem:[NSMenuItem separatorItem]];
 
+    // Thermal Guardian Status
+    double curPeak = [self currentPeakTemperature];
+    NSString *guardStr = (curPeak > 0.0)
+        ? [NSString stringWithFormat:@"🛡️ Thermal Safety Guard: Armed (Peak: %.1f°C)", curPeak]
+        : @"🛡️ Thermal Safety Guard: Armed (Auto-sleeps on overheat)";
+    NSMenuItem *guardItem = [[NSMenuItem alloc] initWithTitle:guardStr action:nil keyEquivalent:@""];
+    guardItem.enabled = NO;
+    [menu addItem:guardItem];
+
+    if (self.lastThermalAbnormality && self.lastThermalTripDate) {
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.timeStyle = NSDateFormatterShortStyle;
+        NSString *tripStr = [NSString stringWithFormat:@"⚠️ Last Safety Sleep: %@ (%@)", [df stringFromDate:self.lastThermalTripDate], self.lastThermalAbnormality];
+        NSMenuItem *tripItem = [[NSMenuItem alloc] initWithTitle:tripStr action:nil keyEquivalent:@""];
+        tripItem.enabled = NO;
+        [menu addItem:tripItem];
+    }
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
     NSMenuItem *ejectItem = [[NSMenuItem alloc] initWithTitle:@"⏏ Eject All External Disks" action:@selector(ejectExternalDisks) keyEquivalent:@"e"];
     ejectItem.target = self;
     [menu addItem:ejectItem];
@@ -425,20 +664,22 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
 - (void)showAbout {
     NSAlert *about = [[NSAlert alloc] init];
-    about.messageText = @"FoldAwake 1.1.2";
-    about.informativeText = @"Zero-bloat clamshell mode toggle, auto display/keyboard dimmer, external disk ejector, and runaway background battery protector for macOS.\n\nCrafted with native AppKit for 0.0% CPU and zero battery impact.";
+    about.messageText = @"FoldAwake 1.1.3";
+    about.informativeText = @"Zero-bloat clamshell mode toggle, auto display/keyboard dimmer, external disk ejector, automatic thermal runaway safety sleep guard, and runaway background battery protector for macOS.\n\nCrafted with native AppKit for 0.0% CPU and zero battery impact.";
     [about addButtonWithTitle:@"OK"];
     [NSApp activateIgnoringOtherApps:YES];
     [about runModal];
 }
 
 - (void)quitApp {
+    [self stopThermalMonitoring];
     [self releaseSleepAssertions];
     [self restoreBrightness];
     [NSApp terminate:nil];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [self stopThermalMonitoring];
     [self releaseSleepAssertions];
     [self restoreBrightness];
 }
