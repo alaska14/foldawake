@@ -1,0 +1,6 @@
+
+build/
+*.dmg
+*.app/
+*_bin
+.DS_Store

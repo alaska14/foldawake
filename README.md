@@ -2,10 +2,9 @@
   <img src="docs/assets/FoldAwake-Cover-1280x720.png" alt="FoldAwake Banner" width="800">
   <br><br>
   
-  [![Support on Gumroad](https://img.shields.io/badge/Support_on_Gumroad-%242.99+-102039?style=for-the-badge&logo=gumroad&logoColor=white)](https://monolabapps.gumroad.com/l/foldawake)
-  [![Free Release](https://img.shields.io/badge/Download-Free_DMG_(v1.2.0)-success?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alaska14/foldawake/releases/latest)
+  [![Get it on Gumroad](https://img.shields.io/badge/Get_it_on_Gumroad-%242.99+-102039?style=for-the-badge&logo=gumroad&logoColor=white)](https://monolabapps.gumroad.com/l/foldawake)
+  [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey?style=for-the-badge)](LICENSE)
   [![AlternativeTo](https://img.shields.io/badge/AlternativeTo-Listed-blue?style=for-the-badge)](https://alternativeto.net/software/foldawake/)
-  [![Homebrew](https://img.shields.io/badge/Homebrew-v1.2.0-orange?style=for-the-badge&logo=homebrew&logoColor=white)](#option-1-homebrew-free)
 </div>
 
 <br>
@@ -35,27 +34,23 @@ macOS normally puts your laptop to sleep the moment you shut the lid unless you'
 
 ## 📦 Installation
 
-### Option 1: Homebrew (Free)
-```bash
-brew tap alaska14/tap
-brew trust alaska14/tap   # Homebrew 7+ requires trusting third-party taps
-brew install --cask foldawake
-```
-
-### Option 2: Download Free DMG
-Download the DMG directly from **[GitHub Releases](https://github.com/alaska14/foldawake/releases/latest)**.
+### Get FoldAwake on Gumroad (recommended)
+**[monolabapps.gumroad.com/l/foldawake](https://monolabapps.gumroad.com/l/foldawake)** gives you the ready-to-use app as a DMG, plus future updates. Open the DMG and drag `FoldAwake.app` to `/Applications`.
 
 > **First launch:** MonoLab apps are not notarized by Apple yet. If macOS says the app can't be verified, right-click the app → **Open** (or System Settings → Privacy & Security → **Open Anyway**) once.
 
-### Option 3: Support Development on Gumroad
-If you love FoldAwake and want to support indie Mac development, you can pay what you want on **[Gumroad (monolabapps.gumroad.com/l/foldawake)](https://monolabapps.gumroad.com/l/foldawake)**!
-
----
+### Build from source
+FoldAwake is open source (MIT). If you prefer to build it yourself, you need Apple's Command Line Tools (`xcode-select --install`):
+```bash
+git clone https://github.com/alaska14/foldawake.git
+cd foldawake
+./build.sh          # creates build/FoldAwake.app
+```
 
 ## 💬 Feedback & Feature Requests
 
 Have a suggestion, found an edge case, or want to report a bug?
 - **[Open an Issue](https://github.com/alaska14/foldawake/issues)** right here on GitHub.
-- Or reach out directly at **[monolabapps.gumroad.com](https://monolabapps.gumroad.com)**.
+- Bought it on Gumroad? Just reply to your receipt email.
 
 Crafted with care by **MonoLab**.
