@@ -3,9 +3,9 @@
   <br><br>
   
   [![Support on Gumroad](https://img.shields.io/badge/Support_on_Gumroad-%242.99+-102039?style=for-the-badge&logo=gumroad&logoColor=white)](https://monolabapps.gumroad.com/l/foldawake)
-  [![Free Release](https://img.shields.io/badge/Download-Free_DMG_(v1.1.1)-success?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alaska14/foldawake/releases/latest)
+  [![Free Release](https://img.shields.io/badge/Download-Free_DMG_(v1.2.0)-success?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alaska14/foldawake/releases/latest)
   [![AlternativeTo](https://img.shields.io/badge/AlternativeTo-Listed-blue?style=for-the-badge)](https://alternativeto.net/software/foldawake/)
-  [![Homebrew](https://img.shields.io/badge/Homebrew-v1.1.1-orange?style=for-the-badge&logo=homebrew&logoColor=white)](#option-1-homebrew-free)
+  [![Homebrew](https://img.shields.io/badge/Homebrew-v1.2.0-orange?style=for-the-badge&logo=homebrew&logoColor=white)](#option-1-homebrew-free)
 </div>
 
 <br>
@@ -28,8 +28,8 @@ macOS normally puts your laptop to sleep the moment you shut the lid unless you'
   - **Crisp White Clamshell (100%):** Active (laptop stays awake and working with lid shut).
   - **Dimmed Gray Clamshell (35%):** Inactive (normal macOS sleep when closed).
 - ⏏️ **1-Click Safe Disk Ejection:** Right-click the menu bar icon to safely unmount all external USB/Thunderbolt drives before packing your laptop into your bag.
-- 🛡️ **Runaway Battery Watchdog:** Automatically detects orphaned background processes (e.g. runaway browser tabs or frozen video engines) and terminates them to prevent unexpected battery drain.
-- 🍃 **Native AppKit Engineering:** Written directly in native Objective-C. Sits at 0.0% CPU overhead, uses under 15MB RAM, and never drains battery in the background.
+- 🍃 **Native AppKit Engineering:** Written directly in native Objective-C. Event-driven (no polling while clamshell mode is off), ~0% CPU and under 15MB RAM.
+- 🔒 **Fail-Safe:** Quitting FoldAwake always restores normal lid sleep, and your on/off choice is remembered across restarts.
 
 ---
 
@@ -38,11 +38,14 @@ macOS normally puts your laptop to sleep the moment you shut the lid unless you'
 ### Option 1: Homebrew (Free)
 ```bash
 brew tap alaska14/tap
+brew trust alaska14/tap   # Homebrew 7+ requires trusting third-party taps
 brew install --cask foldawake
 ```
 
 ### Option 2: Download Free DMG
-Download the signed DMG directly from **[GitHub Releases (v1.1.1)](https://github.com/alaska14/foldawake/releases/latest)**.
+Download the DMG directly from **[GitHub Releases](https://github.com/alaska14/foldawake/releases/latest)**.
+
+> **First launch:** MonoLab apps are not notarized by Apple yet. If macOS says the app can't be verified, right-click the app → **Open** (or System Settings → Privacy & Security → **Open Anyway**) once.
 
 ### Option 3: Support Development on Gumroad
 If you love FoldAwake and want to support indie Mac development, you can pay what you want on **[Gumroad (monolabapps.gumroad.com/l/foldawake)](https://monolabapps.gumroad.com/l/foldawake)**!

@@ -98,8 +98,18 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     self.lastThermalAbnormality = nil;
     self.lastThermalTripDate = nil;
 
-    // Check system state ONCE at launch (zero recurring popen!)
-    self.isAwake = [self checkSleepDisabled];
+    // Restore the user's last choice. pmset's disablesleep is a persistent system-wide
+    // flag, so if it is still set while the user's choice is "off" (e.g. after a crash
+    // or force-quit), reset it so the Mac can sleep normally again.
+    BOOL wantsAwake = [[NSUserDefaults standardUserDefaults] boolForKey:@"FoldAwakeClamshellEnabled"];
+    BOOL systemSleepDisabled = [self checkSleepDisabled];
+    if (wantsAwake && [self hasSudoPermission]) {
+        if (!systemSleepDisabled) [self setSystemSleepDisabled:YES];
+        self.isAwake = YES;
+    } else {
+        if (systemSleepDisabled) [self setSystemSleepDisabled:NO];
+        self.isAwake = NO;
+    }
     if (self.isAwake) {
         [self acquireSleepAssertions];
         if ([self isLidClosed]) {
@@ -108,14 +118,63 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     }
     [self updateIcon];
 
-    // Register 100% event-driven IOKit clamshell notification (0.0% CPU, NO POLLING!)
+    // Register 100% event-driven IOKit clamshell notification (no polling)
     [self registerClamshellNotification];
 
     // Register event-driven keyboard brightness notification
     [self registerKeyboardNotifications];
 
-    // Passive low-overhead brightness check (every 15s, purely in-memory, zero subshells)
-    self.brightnessCacheTimer = [NSTimer scheduledTimerWithTimeInterval:15.0 target:self selector:@selector(cacheActiveBrightness) userInfo:nil repeats:YES];
+    // Brightness cache timer only runs while clamshell mode is enabled (it is only
+    // needed to restore brightness after the lid was closed).
+    [self updateBrightnessCacheTimer];
+
+    // Restore normal sleep if we are terminated by a signal (e.g. `killall`, Activity Monitor "Quit")
+    [self installTerminationSignalHandlers];
+
+    [self ensureAutoStart];
+}
+
+- (void)updateBrightnessCacheTimer {
+    if (self.isAwake && !self.brightnessCacheTimer) {
+        self.brightnessCacheTimer = [NSTimer scheduledTimerWithTimeInterval:15.0 target:self selector:@selector(cacheActiveBrightness) userInfo:nil repeats:YES];
+        self.brightnessCacheTimer.tolerance = 5.0;
+    } else if (!self.isAwake && self.brightnessCacheTimer) {
+        [self.brightnessCacheTimer invalidate];
+        self.brightnessCacheTimer = nil;
+    }
+}
+
+- (void)installTerminationSignalHandlers {
+    static NSMutableArray *sources = nil;
+    sources = [NSMutableArray array];
+    for (NSNumber *sigNum in @[@(SIGTERM), @(SIGINT), @(SIGHUP)]) {
+        int sig = sigNum.intValue;
+        signal(sig, SIG_IGN);
+        dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, sig, 0, dispatch_get_main_queue());
+        dispatch_source_set_event_handler(src, ^{
+            [self quitApp];
+        });
+        dispatch_resume(src);
+        [sources addObject:src];
+    }
+}
+
+- (void)ensureAutoStart {
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    if (![defs boolForKey:@"hasConfiguredAutoStart"]) {
+        [defs setBool:YES forKey:@"hasConfiguredAutoStart"];
+        NSString *appPath = [[NSBundle mainBundle] bundlePath];
+        if (appPath && [appPath hasPrefix:@"/Applications"]) {
+            NSString *script = [NSString stringWithFormat:
+                @"tell application \"System Events\"\n"
+                @"  if not (exists (login item \"FoldAwake\")) then\n"
+                @"    make login item at end with properties {path:\"%@\", hidden:false}\n"
+                @"  end if\n"
+                @"end tell", appPath];
+            NSAppleScript *as = [[NSAppleScript alloc] initWithSource:script];
+            [as executeAndReturnError:nil];
+        }
+    }
 }
 
 #pragma mark - IOKit Event Notification (Zero CPU)
@@ -155,8 +214,25 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 #pragma mark - Permissions / Authorization
 
 - (BOOL)hasSudoPermission {
-    int status = system("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0 2>/dev/null >/dev/null");
-    return (status == 0);
+    // Only *lists* the sudoers rules (never executes pmset), so probing permission
+    // never changes the user's current clamshell state. We require an explicit
+    // NOPASSWD rule for pmset disablesleep; a generic "(ALL) ALL" would still need a password.
+    FILE *fp = popen("/usr/bin/sudo -n -l 2>/dev/null", "r");
+    if (!fp) return NO;
+    char line[1024];
+    BOOL ok = NO;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "NOPASSWD") && strstr(line, "/usr/bin/pmset -a disablesleep")) {
+            ok = YES;
+        }
+    }
+    pclose(fp);
+    return ok;
+}
+
+- (void)setSystemSleepDisabled:(BOOL)disabled {
+    system(disabled ? "/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1"
+                    : "/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1");
 }
 
 - (void)checkAuthorizationOnLaunch {
@@ -405,7 +481,7 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
             // Re-arm keep-awake if it was active
             if (self.isAwake) {
                 [self acquireSleepAssertions];
-                system("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 1");
+                [self setSystemSleepDisabled:YES];
             }
             [self updateIcon];
 
@@ -422,9 +498,6 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
             [self setDisplayBrightness:0.0f];
             [self setKeyboardBrightness:0.0f commit:NO];
             self.wasDimmedForClamshell = YES;
-
-            // Run zombie cleanup once when packed away
-            [self reapRunawayZombies];
 
             // Start active Thermal Guardian monitoring while folded shut
             [self startThermalMonitoring];
@@ -499,7 +572,7 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     [self releaseSleepAssertions];
 
     // 2. Overrule pmset disablesleep
-    system("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0");
+    [self setSystemSleepDisabled:NO];
 
     // 3. Put Mac to sleep until user opens the lid
     system("/usr/bin/pmset sleepnow &");
@@ -667,8 +740,9 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
     BOOL newState = !self.isAwake;
     self.isAwake = newState;
 
-    NSString *cmd = newState ? @"/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 1" : @"/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0";
-    system([cmd UTF8String]);
+    [self setSystemSleepDisabled:newState];
+    [[NSUserDefaults standardUserDefaults] setBool:newState forKey:@"FoldAwakeClamshellEnabled"];
+    [self updateBrightnessCacheTimer];
 
     if (newState) {
         [self acquireSleepAssertions];
@@ -779,44 +853,35 @@ static void powerNotificationCallback(void *refCon, io_service_t service, natura
 
 - (void)showAbout {
     NSAlert *about = [[NSAlert alloc] init];
-    about.messageText = @"FoldAwake 1.1.3";
-    about.informativeText = @"Zero-bloat clamshell mode toggle, auto display/keyboard dimmer, external disk ejector, automatic thermal runaway safety sleep guard, and runaway background battery protector for macOS.\n\nCrafted with native AppKit for 0.0% CPU and zero battery impact.";
+    NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
+    about.messageText = [NSString stringWithFormat:@"FoldAwake %@", version];
+    about.informativeText = @"Zero-bloat clamshell mode toggle, auto display/keyboard dimmer, external disk ejector and automatic thermal safety sleep guard for macOS.\n\nNative AppKit, event-driven, near-zero CPU while idle.";
     [about addButtonWithTitle:@"OK"];
     [NSApp activateIgnoringOtherApps:YES];
     [about runModal];
 }
 
-- (void)quitApp {
+- (void)restoreNormalSleep {
+    static BOOL didRestore = NO;
+    if (didRestore) return;
+    didRestore = YES;
     [self stopThermalMonitoring];
     [self releaseSleepAssertions];
     [self restoreBrightness];
+    // pmset disablesleep is persistent and system-wide: never leave it set once
+    // FoldAwake (and its Thermal Guardian) is no longer running.
+    if (self.isAwake || [self checkSleepDisabled]) {
+        [self setSystemSleepDisabled:NO];
+    }
+}
+
+- (void)quitApp {
+    [self restoreNormalSleep];
     [NSApp terminate:nil];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
-    [self stopThermalMonitoring];
-    [self releaseSleepAssertions];
-    [self restoreBrightness];
-}
-
-- (void)reapRunawayZombies {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-        FILE *fp = popen("/bin/ps -eo pid,ppid,pcpu,comm | /usr/bin/grep 'com.apple.WebKit.WebContent' | /usr/bin/awk '$2 == 1 && $3 > 80 {print $1, $3}'", "r");
-        if (!fp) return;
-        char line[128];
-        while (fgets(line, sizeof(line), fp)) {
-            int pid = 0;
-            float cpu = 0;
-            if (sscanf(line, "%d %f", &pid, &cpu) == 2 && pid > 1) {
-                kill(pid, SIGKILL);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    NSString *msg = [NSString stringWithFormat:@"Terminated orphaned WebKit background leak (PID %d, %.0f%% CPU).", pid, cpu];
-                    [self sendNotificationWithTitle:@"Battery Saver Guard" message:msg];
-                });
-            }
-        }
-        pclose(fp);
-    });
+    [self restoreNormalSleep];
 }
 
 #pragma mark - Option 1: Clean Clamshell Outline (Active = 100% White, Inactive = 35% Dimmed Gray)
